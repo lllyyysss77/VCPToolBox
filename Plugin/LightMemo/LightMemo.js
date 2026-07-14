@@ -140,9 +140,11 @@ class LightMemoPlugin {
 
     async processToolCall(args) {
         try {
-            const result = this._isMappingRequest(args)
-                ? await this.handleMapping(args)
-                : await this.handleSearch(args);
+            const result = this._isTagMemoABRequest(args)
+                ? await this.handleTagMemoAB(args)
+                : this._isMappingRequest(args)
+                    ? await this.handleMapping(args)
+                    : await this.handleSearch(args);
 
             return this._normalizeToolResult(result);
         } catch (error) {
@@ -527,6 +529,259 @@ class LightMemoPlugin {
         }
 
         return this.formatResults(finalResults, query);
+    }
+
+    _isTagMemoABRequest(args = {}) {
+        const command = String(args.command || args.action || '').trim().toLowerCase();
+        const mode = String(args.ab_mode || args.abMode || '').trim().toLowerCase();
+        return [
+            'tagmemo_ab', 'tagmemo-ab', 'memory_address_ab',
+            'memory-address-ab', '双轨寻址', '双轨测绘'
+        ].includes(command) || ['a', 'b', 'mode_a', 'mode_b', 'kernel', 'product'].includes(mode);
+    }
+
+    /**
+     * TagMemo V8.3/V9 双轨寻址。
+     * 模式 A：固定对称候选超集测核；模式 B：两版本独立端到端寻址测产品。
+     */
+    async handleTagMemoAB(args = {}) {
+        if (!this.vectorDBManager || typeof this.vectorDBManager.applyTagBoost !== 'function') {
+            throw new Error('TagMemo A/B 无法执行：KnowledgeBaseManager 未注入或版本接口不可用。');
+        }
+
+        const query = String(args.query || args.start || '').trim();
+        if (!query) throw new Error('TagMemo A/B 需要 query 参数。');
+
+        const parsedMaidScope = this._parseMaidScopedFolder(args.maid);
+        const maid = parsedMaidScope.maid;
+        const folder = this._mergeFolderScopes(args.folder, parsedMaidScope.folder);
+        const searchAll = this._parseBoolean(args.search_all_knowledge_bases, false);
+        if (!searchAll && !maid && !folder) {
+            throw new Error('TagMemo A/B 必须提供 maid/folder，或开启 search_all_knowledge_bases。');
+        }
+
+        const rawMode = String(args.ab_mode || args.abMode || args.mode || 'A').trim().toLowerCase();
+        const abMode = ['b', 'mode_b', 'product', 'end_to_end'].includes(rawMode) ? 'B' : 'A';
+        const k = Math.max(1, Math.floor(this._parseNumber(args.k, 5)));
+        const topL = Math.max(k, Math.floor(this._parseNumber(args.top_l ?? args.topL, Math.max(20, k * 4))));
+        const tagBoost = Math.max(0, Math.min(1, this._parseNumber(
+            typeof args.tag_boost === 'string' ? args.tag_boost.replace(/\+$/, '') : args.tag_boost,
+            0.6
+        )));
+        const coreTags = this._parseStringArray(args.core_tags || args.coreTags);
+        const coreBoostFactor = this._parseNumber(args.core_boost_factor, 1.33);
+        const usePotentialField = this._parseBoolean(args.potential_field ?? args.use_potential_field, true);
+        const useBM25 = this._parseBooleanAlias(
+            [['BM25', args.BM25], ['bm25', args.bm25], ['use_bm25', args.use_bm25]],
+            true,
+            'TagMemo A/B BM25'
+        );
+
+        const candidates = await this._gatherCandidateChunks({
+            maid,
+            folder,
+            searchAll,
+            ignoreExcludedFolders: false,
+            timeRange: null
+        });
+        if (candidates.length === 0) {
+            return this._buildAiFriendlyTextResult('TagMemo A/B：指定作用域内没有可用记忆。');
+        }
+
+        const queryVector = await this.getSingleEmbedding(query);
+        if (!queryVector) throw new Error('TagMemo A/B 查询向量化失败。');
+
+        // 同一调用先固定两套不可变资产包；显式版本采用 strictVersion，禁止实验被回退污染。
+        const snapshots = {
+            v8_3: this.vectorDBManager.getTagMemoArtifactSnapshot('v8_3', { strictVersion: true }),
+            v9: this.vectorDBManager.getTagMemoArtifactSnapshot('v9', { strictVersion: true })
+        };
+        const runs = {};
+        for (const version of ['v8_3', 'v9']) {
+            const snapshot = snapshots[version];
+            const boost = this.vectorDBManager.applyTagBoost(
+                new Float32Array(queryVector),
+                tagBoost,
+                coreTags,
+                coreBoostFactor,
+                {
+                    tagMemoVersion: version,
+                    strictVersion: true,
+                    artifactBundle: snapshot.bundle
+                }
+            );
+            const scored = await this._scoreByVectorSimilarity(candidates, boost.vector);
+            const ranked = scored
+                .map(item => ({
+                    ...item,
+                    id: item.label,
+                    score: item.vectorScore || 0
+                }))
+                .sort((a, b) => b.score - a.score);
+
+            const finalRanked = usePotentialField && boost.energyField
+                ? this.vectorDBManager.geodesicRerank(ranked, {
+                    artifactBundle: snapshot.bundle,
+                    tagMemoVersion: version,
+                    energyField: boost.energyField
+                })
+                : ranked;
+
+            runs[version] = {
+                snapshot,
+                boost,
+                vectorRanked: ranked,
+                ranked: finalRanked,
+                top: finalRanked.slice(0, abMode === 'A' ? topL : k)
+            };
+        }
+
+        if (abMode === 'A') {
+            return this._buildAiFriendlyTextResult(this._formatTagMemoKernelAB({
+                query,
+                candidates,
+                queryVector,
+                runs,
+                topL,
+                k,
+                tagBoost,
+                useBM25
+            }));
+        }
+
+        return this._buildAiFriendlyTextResult(this._formatTagMemoProductAB({
+            query,
+            runs,
+            k,
+            tagBoost,
+            usePotentialField
+        }));
+    }
+
+    _buildBm25TopIds(query, candidates, limit) {
+        const queryTokens = this._tokenize(query);
+        const expanded = this._expandQueryTokens(queryTokens);
+        const allQueryTokens = [...new Set([...queryTokens, ...expanded])];
+        const ranker = new BM25Ranker();
+        const allDocs = candidates.map(candidate => candidate.tokens || []);
+        if (allDocs.length === 0) return [];
+        const idf = ranker.calculateIDF(allDocs);
+        const avgLength = allDocs.reduce((sum, doc) => sum + doc.length, 0) / allDocs.length || 1;
+        return candidates
+            .map(candidate => ({
+                id: candidate.label,
+                score: ranker.score(allQueryTokens, candidate.tokens || [], avgLength, idf)
+            }))
+            .filter(item => item.score > 0)
+            .sort((a, b) => b.score - a.score)
+            .slice(0, limit);
+    }
+
+    _rankMap(items) {
+        return new Map(items.map((item, index) => [
+            Number(item.id ?? item.label),
+            { rank: index + 1, score: Number(item.score ?? item.vectorScore) || 0, item }
+        ]));
+    }
+
+    _shortMemoryText(text, maxLength = 84) {
+        const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+        return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1)}…` : normalized;
+    }
+
+    _formatTagMemoKernelAB({ query, candidates, queryVector, runs, topL, k, tagBoost, useBM25 }) {
+        const rawRanked = candidates
+            .map(candidate => ({
+                ...candidate,
+                id: candidate.label,
+                score: this._cosineSimilarity(queryVector, this._getChunkVector(candidate.label))
+            }))
+            .sort((a, b) => b.score - a.score);
+        const bm25Top = useBM25 ? this._buildBm25TopIds(query, candidates, topL) : [];
+        const sources = new Map();
+        const add = (items, source) => items.slice(0, topL).forEach(item => {
+            const id = Number(item.id ?? item.label);
+            if (!sources.has(id)) sources.set(id, new Set());
+            sources.get(id).add(source);
+        });
+        add(rawRanked, 'KNN');
+        add(runs.v8_3.ranked, 'V8.3');
+        add(runs.v9.ranked, 'V9');
+        add(bm25Top, 'BM25');
+
+        const rawMap = this._rankMap(rawRanked);
+        const v83Map = this._rankMap(runs.v8_3.ranked);
+        const v9Map = this._rankMap(runs.v9.ranked);
+        const byId = new Map(candidates.map(item => [Number(item.label), item]));
+        const ids = [...sources.keys()].sort((a, b) => {
+            const bestA = Math.min(rawMap.get(a)?.rank || Infinity, v83Map.get(a)?.rank || Infinity, v9Map.get(a)?.rank || Infinity);
+            const bestB = Math.min(rawMap.get(b)?.rank || Infinity, v83Map.get(b)?.rank || Infinity, v9Map.get(b)?.rank || Infinity);
+            return bestA - bestB;
+        });
+
+        let text = `\n[--- TagMemo A/B 模式 A：固定对称候选超集测核 ---]\n`;
+        text += `查询: ${query}\n参数: topL=${topL}, displayK=${k}, tag_boost=${tagBoost}, BM25=${useBM25}\n`;
+        text += `资产: V8.3=${runs.v8_3.snapshot.bundle.artifactSig} | V9=${runs.v9.snapshot.bundle.artifactSig}\n`;
+        text += `对称超集: ${ids.length} 个唯一 chunk（KNN ∪ V8.3 ∪ V9${useBM25 ? ' ∪ BM25' : ''}）\n\n`;
+        text += `| # | 候选记忆 | 进入路径 | KNN排名/分数 | V8.3排名/分数 | V9排名/分数 | ΔRank(V9-V8.3) |\n`;
+        text += `|---:|---|---|---:|---:|---:|---:|\n`;
+        ids.slice(0, Math.max(k, 30)).forEach((id, index) => {
+            const candidate = byId.get(id);
+            const raw = rawMap.get(id);
+            const oldRun = v83Map.get(id);
+            const newRun = v9Map.get(id);
+            const delta = oldRun && newRun ? oldRun.rank - newRun.rank : null;
+            const fmt = value => value ? `${value.rank}/${value.score.toFixed(4)}` : '—';
+            text += `| ${index + 1} | ${this._escapeMarkdownCell(this._shortMemoryText(candidate?.text))} | ${[...sources.get(id)].join('+')} | ${fmt(raw)} | ${fmt(oldRun)} | ${fmt(newRun)} | ${delta === null ? '—' : delta > 0 ? `+${delta}` : delta} |\n`;
+        });
+        text += `\n说明: 正 ΔRank 表示 V9 相对 V8.3 将候选前移。两版本在完全相同的候选超集上比较，测量传播核与场响应差异，不代表最终产品独立召回收益。\n`;
+        text += `[--- 模式 A 结束 ---]\n`;
+        return text;
+    }
+
+    _formatTagMemoProductAB({ query, runs, k, tagBoost, usePotentialField }) {
+        const oldTop = runs.v8_3.top;
+        const newTop = runs.v9.top;
+        const oldIds = new Set(oldTop.map(item => Number(item.id ?? item.label)));
+        const newIds = new Set(newTop.map(item => Number(item.id ?? item.label)));
+        const overlap = [...oldIds].filter(id => newIds.has(id));
+        const oldOnly = [...oldIds].filter(id => !newIds.has(id));
+        const newOnly = [...newIds].filter(id => !oldIds.has(id));
+        const oldMap = this._rankMap(oldTop);
+        const newMap = this._rankMap(newTop);
+        const items = new Map();
+        [...oldTop, ...newTop].forEach(item => items.set(Number(item.id ?? item.label), item));
+        const union = [...new Set([...newIds, ...oldIds])];
+
+        let text = `\n[--- TagMemo A/B 模式 B：端到端独立寻址测产品 ---]\n`;
+        text += `查询: ${query}\n参数: k=${k}, tag_boost=${tagBoost}, potential_field=${usePotentialField}\n`;
+        text += `资产: V8.3=${runs.v8_3.snapshot.bundle.artifactSig} | V9=${runs.v9.snapshot.bundle.artifactSig}\n`;
+        text += `重合=${overlap.length}/${k} (${(overlap.length / k * 100).toFixed(1)}%) | V8.3独占=${oldOnly.length} | V9独占=${newOnly.length}\n\n`;
+        text += `| 记忆片段 | V8.3排名/分数 | V9排名/分数 | 归属 |\n`;
+        text += `|---|---:|---:|---|\n`;
+        union.forEach(id => {
+            const oldItem = oldMap.get(id);
+            const newItem = newMap.get(id);
+            const owner = oldItem && newItem ? '共同召回' : newItem ? 'V9 独占' : 'V8.3 独占';
+            const fmt = value => value ? `${value.rank}/${value.score.toFixed(4)}` : '—';
+            text += `| ${this._escapeMarkdownCell(this._shortMemoryText(items.get(id)?.text, 100))} | ${fmt(oldItem)} | ${fmt(newItem)} | ${owner} |\n`;
+        });
+        text += `\nV9 独占召回用于人工判断是否抵达 V8.3 看不见的有效记忆；V8.3 独占项用于检查 V9 是否发生召回损失或主题漂移。\n`;
+        text += `[--- 模式 B 结束 ---]\n`;
+        return text;
+    }
+
+    _getChunkVector(chunkId) {
+        const db = this.vectorDBManager?.db;
+        const dim = this.vectorDBManager?.config?.dimension;
+        if (!db || !dim) return null;
+        const row = db.prepare('SELECT vector FROM chunks WHERE id = ?').get(chunkId);
+        if (!row?.vector || row.vector.length !== dim * 4) return null;
+        if (row.vector.byteOffset % 4 === 0) {
+            return new Float32Array(row.vector.buffer, row.vector.byteOffset, dim);
+        }
+        const copied = Buffer.from(row.vector);
+        return new Float32Array(copied.buffer, copied.byteOffset, dim);
     }
 
     /**

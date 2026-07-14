@@ -47,6 +47,40 @@
     ]
   },
   "KnowledgeBaseManager": {
+    "tagMemoVersioning": {
+      "activeVersion": "v8_3",
+      "fallbackVersion": "v8_3",
+      "availableVersions": [
+        "v8_3",
+        "v9"
+      ],
+      "dualArtifacts": true,
+      "strictExplicitVersion": true
+    },
+    "v9": {
+      "outboundMass": 0.95,
+      "evidenceCompression": 1,
+      "wormholeGain": 1.35,
+      "tensionThreshold": 1
+    },
+    "intrinsicResidual": {
+      "method": "anchored_gs",
+      "maxNeighbors": 48,
+      "maxBasis": 4,
+      "minNeighbors": 3,
+      "semanticEnabled": true,
+      "semanticPeak": 0.65,
+      "semanticSigma": 0.25,
+      "semanticFloor": 0.35,
+      "semanticHardFloor": -1,
+      "minGain": 0.015,
+      "positionDecay": 0.15,
+      "v9AnchorBase": 0.75,
+      "v9AnchorScale": 1.25,
+      "v9AnchorGamma": 1,
+      "v9AnchorMin": 0.5,
+      "v9AnchorMax": 2
+    },
     "geodesicRerank": {
       "alpha": 0.45,
       "minGeoSamples": 4,

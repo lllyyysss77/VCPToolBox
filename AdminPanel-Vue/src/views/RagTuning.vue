@@ -212,6 +212,11 @@
           </div>
         </header>
 
+        <TagMemoV9ControlPanel
+          v-if="knowledgeBaseParams"
+          v-model="knowledgeBaseParams"
+        />
+
         <article
           v-for="section in groupSections"
           :id="section.anchor"
@@ -734,6 +739,7 @@ import UiInput from "@/components/ui/UiInput.vue";
 import UiPageActions from "@/components/ui/UiPageActions.vue";
 import UiSelect from "@/components/ui/UiSelect.vue";
 import OrderedCooccurrenceModal from "@/features/rag-tuning/OrderedCooccurrenceModal.vue";
+import TagMemoV9ControlPanel from "@/features/rag-tuning/TagMemoV9ControlPanel.vue";
 import WormholeRoutingModal from "@/features/rag-tuning/WormholeRoutingModal.vue";
 import {
   GROUP_ORDER,
@@ -795,6 +801,11 @@ interface GroupSection {
 }
 
 const WORMHOLE_GROUP_NAME = "KnowledgeBaseManager";
+const TAGMEMO_V9_DEDICATED_KEYS = new Set([
+  "tagMemoVersioning",
+  "v9",
+  "intrinsicResidual",
+]);
 const WORMHOLE_PARAM_KEY = "spikeRouting";
 const GEODESIC_GROUP_NAME = "KnowledgeBaseManager";
 const GEODESIC_PARAM_KEY = "geodesicRerank";
@@ -828,17 +839,25 @@ function cloneParams(source: RagParams): RagParams {
   return JSON.parse(JSON.stringify(source));
 }
 
-function isNumericRecord(value: ParamValue | undefined): value is NumericRecord {
+function isParamRecord(value: ParamValue | undefined): value is Record<string, ParamValue> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNumericRecord(value: ParamValue | undefined): value is NumericRecord {
+  return isParamRecord(value)
+    && Object.values(value).every((item) => typeof item === "number" && Number.isFinite(item));
 }
 
 function countLeafValues(value: ParamValue): number {
   if (Array.isArray(value)) {
-    return value.length;
+    return value.reduce<number>((total, item) => total + countLeafValues(item), 0);
   }
 
-  if (isNumericRecord(value)) {
-    return Object.keys(value).length;
+  if (isParamRecord(value)) {
+    return Object.values(value).reduce<number>(
+      (total, item) => total + countLeafValues(item),
+      0
+    );
   }
 
   return 1;
@@ -852,26 +871,26 @@ function countChangedLeaves(current: ParamValue, original?: ParamValue): number 
   if (Array.isArray(current) && Array.isArray(original)) {
     const maxLength = Math.max(current.length, original.length);
     let changedCount = 0;
-
     for (let index = 0; index < maxLength; index += 1) {
-      if (current[index] !== original[index]) {
-        changedCount += 1;
-      }
+      const currentItem = current[index];
+      const originalItem = original[index];
+      if (currentItem === undefined) changedCount += countLeafValues(originalItem);
+      else if (originalItem === undefined) changedCount += countLeafValues(currentItem);
+      else changedCount += countChangedLeaves(currentItem, originalItem);
     }
-
     return changedCount;
   }
 
-  if (isNumericRecord(current) && isNumericRecord(original)) {
+  if (isParamRecord(current) && isParamRecord(original)) {
     const keys = new Set([...Object.keys(current), ...Object.keys(original)]);
     let changedCount = 0;
-
     keys.forEach((key) => {
-      if (current[key] !== original[key]) {
-        changedCount += 1;
-      }
+      const currentItem = current[key];
+      const originalItem = original[key];
+      if (currentItem === undefined) changedCount += countLeafValues(originalItem);
+      else if (originalItem === undefined) changedCount += countLeafValues(currentItem);
+      else changedCount += countChangedLeaves(currentItem, originalItem);
     });
-
     return changedCount;
   }
 
@@ -915,7 +934,7 @@ function buildEntry(
   paramKey: string,
   value: ParamValue,
   original: ParamValue | undefined
-): ParamEntry {
+): ParamEntry | null {
   const base = {
     key: paramKey,
     fieldId: createFieldId(groupName, paramKey),
@@ -924,24 +943,33 @@ function buildEntry(
     totalLeaves: countLeafValues(value),
   };
 
-  if (Array.isArray(value)) {
-    return { ...base, kind: "tuple", value };
+  if (Array.isArray(value) && value.every((item) => typeof item === "number")) {
+    return { ...base, kind: "tuple", value: value as number[] };
   }
 
   if (isNumericRecord(value)) {
     return { ...base, kind: "nested", value };
   }
 
-  return { ...base, kind: "number", value };
+  if (typeof value === "number") {
+    return { ...base, kind: "number", value };
+  }
+
+  return null;
 }
 
 const groupSections = computed<GroupSection[]>(() =>
   Object.entries(params.value)
     .sort(([left], [right]) => compareGroupOrder(left, right))
     .map(([groupName, groupParams]) => {
-      const entries = Object.entries(groupParams).map(([paramKey, value]) =>
-        buildEntry(groupName, paramKey, value, originalParams.value[groupName]?.[paramKey])
-      );
+      const entries = Object.entries(groupParams)
+        .filter(([paramKey]) =>
+          groupName !== "KnowledgeBaseManager" || !TAGMEMO_V9_DEDICATED_KEYS.has(paramKey)
+        )
+        .map(([paramKey, value]) =>
+          buildEntry(groupName, paramKey, value, originalParams.value[groupName]?.[paramKey])
+        )
+        .filter((entry): entry is ParamEntry => entry !== null);
 
       return {
         name: groupName,
@@ -955,12 +983,39 @@ const groupSections = computed<GroupSection[]>(() =>
     })
 );
 
+const knowledgeBaseParams = computed<ParamGroup>({
+  get: () => params.value.KnowledgeBaseManager || {},
+  set: (value) => {
+    params.value.KnowledgeBaseManager = value;
+  },
+});
+
+const dedicatedLeafCount = computed(() => {
+  const current = params.value.KnowledgeBaseManager || {};
+  return [...TAGMEMO_V9_DEDICATED_KEYS].reduce((total, key) => {
+    const value = current[key];
+    return total + (value === undefined ? 0 : countLeafValues(value));
+  }, 0);
+});
+
+const dedicatedChangedLeafCount = computed(() => {
+  const current = params.value.KnowledgeBaseManager || {};
+  const original = originalParams.value.KnowledgeBaseManager || {};
+  return [...TAGMEMO_V9_DEDICATED_KEYS].reduce((total, key) => {
+    const value = current[key];
+    if (value === undefined) return total;
+    return total + countChangedLeaves(value, original[key]);
+  }, 0);
+});
+
 const totalLeafCount = computed(() =>
   groupSections.value.reduce((total, section) => total + section.totalLeaves, 0)
+  + dedicatedLeafCount.value
 );
 
 const changedLeafCount = computed(() =>
   groupSections.value.reduce((total, section) => total + section.changedLeaves, 0)
+  + dedicatedChangedLeafCount.value
 );
 
 const isDirty = computed(() => changedLeafCount.value > 0);

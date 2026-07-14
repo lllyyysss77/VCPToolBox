@@ -259,6 +259,38 @@ class KnowledgeBaseManager {
                 neighbor_count INTEGER NOT NULL,
                 computed_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+            -- TagMemo V9 P0: 派生资产注册表。
+            -- 每个 artifact_sig 必须唯一描述模型、图代际、算法版本与实际配置。
+            CREATE TABLE IF NOT EXISTS tagmemo_artifacts (
+                artifact_sig TEXT PRIMARY KEY,
+                asset_type TEXT NOT NULL,
+                model_sig TEXT NOT NULL,
+                graph_generation TEXT NOT NULL,
+                algorithm_version TEXT NOT NULL,
+                config_hash TEXT NOT NULL,
+                effective_config TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ready',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tagmemo_artifacts_lookup
+                ON tagmemo_artifacts(asset_type, model_sig, status);
+
+            -- TagMemo V9 P0: residual 的“已处理”状态与数值结果分离。
+            -- 邻居不足、缺向量和失败记录也会落表，避免缓存完整性永久为 false。
+            CREATE TABLE IF NOT EXISTS tag_intrinsic_residual_status (
+                tag_id INTEGER NOT NULL,
+                artifact_sig TEXT NOT NULL,
+                status TEXT NOT NULL,
+                neighbor_count INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                computed_at INTEGER NOT NULL,
+                PRIMARY KEY (tag_id, artifact_sig),
+                FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_intrinsic_residual_status_artifact
+                ON tag_intrinsic_residual_status(artifact_sig, status);
+
             -- 🌟 TagMemo V8.2: 持久化的 Tag 对语义距离 (Pairwise Cosine Similarity)
             -- 与 tag_intrinsic_residuals 平级，构成"节点质量 + 边距离"的物理量底座。
             CREATE TABLE IF NOT EXISTS tag_pair_similarity (
@@ -272,6 +304,27 @@ class KnowledgeBaseManager {
                 FOREIGN KEY (tag_b) REFERENCES tags(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_pair_sim_model ON tag_pair_similarity(model_sig);
+
+            -- TagMemo V9 P0: Pairwise 正/负结果统一状态缓存。
+            -- below_threshold 也属于已完成计算，防止增量任务反复计算噪声 pair。
+            CREATE TABLE IF NOT EXISTS tag_pair_similarity_status (
+                tag_a INTEGER NOT NULL,
+                tag_b INTEGER NOT NULL,
+                model_sig TEXT NOT NULL,
+                artifact_sig TEXT NOT NULL,
+                status TEXT NOT NULL,
+                similarity REAL,
+                min_similarity REAL NOT NULL,
+                computed_at INTEGER NOT NULL,
+                PRIMARY KEY (tag_a, tag_b, artifact_sig),
+                FOREIGN KEY (tag_a) REFERENCES tags(id) ON DELETE CASCADE,
+                FOREIGN KEY (tag_b) REFERENCES tags(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_pair_sim_status_artifact
+                ON tag_pair_similarity_status(artifact_sig, status);
+            CREATE INDEX IF NOT EXISTS idx_pair_sim_status_model
+                ON tag_pair_similarity_status(model_sig);
+
             CREATE TABLE IF NOT EXISTS kv_store (
                 key TEXT PRIMARY KEY,
                 value TEXT,
@@ -304,12 +357,39 @@ class KnowledgeBaseManager {
 
         `);
 
-        // 🛠️ 核心修复：由于 db.exec 不支持动态执行 SELECT 返回的 SQL，我们手动补丁
-        try {
-            this.db.prepare("ALTER TABLE file_tags ADD COLUMN position INTEGER NOT NULL DEFAULT 0").run();
-        } catch (e) {
-            // 如果列已存在，SQLite 会报错，忽略即可
-        }
+        // 🛠️ SQLite 附加式迁移：保留旧表与旧列语义，缺失时逐列补齐。
+        // 不重建生产表，确保老数据库和旧版原生二进制仍可启动/回退。
+        const addColumnIfMissing = (table, column, definition) => {
+            try {
+                const columns = this.db.prepare(`PRAGMA table_info(${table})`).all();
+                if (!columns.some(item => item.name === column)) {
+                    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+                    console.log(`[KnowledgeBase] 🧱 Schema migration: added ${table}.${column}`);
+                }
+            } catch (e) {
+                console.error(`[KnowledgeBase] ❌ Schema migration failed for ${table}.${column}:`, e.message);
+                throw e;
+            }
+        };
+
+        addColumnIfMissing('file_tags', 'position', 'INTEGER NOT NULL DEFAULT 0');
+
+        // residual_energy 永远保留为 V8.3 兼容读取值；以下列承载稳定测量与双轨语义。
+        addColumnIfMissing('tag_intrinsic_residuals', 'raw_residual_ratio', 'REAL');
+        addColumnIfMissing('tag_intrinsic_residuals', 'v8_3_compat_gain', 'REAL');
+        addColumnIfMissing('tag_intrinsic_residuals', 'v9_anchor_gain', 'REAL');
+        addColumnIfMissing('tag_intrinsic_residuals', 'model_sig', 'TEXT');
+        addColumnIfMissing('tag_intrinsic_residuals', 'artifact_sig', 'TEXT');
+        addColumnIfMissing('tag_intrinsic_residuals', 'algorithm_version', 'TEXT');
+        addColumnIfMissing('tag_intrinsic_residuals', 'config_hash', 'TEXT');
+        addColumnIfMissing('tag_intrinsic_residuals', 'status', "TEXT NOT NULL DEFAULT 'computed'");
+
+        this.db.exec(`
+            CREATE INDEX IF NOT EXISTS idx_intrinsic_residual_artifact
+                ON tag_intrinsic_residuals(artifact_sig);
+            CREATE INDEX IF NOT EXISTS idx_intrinsic_residual_model
+                ON tag_intrinsic_residuals(model_sig);
+        `);
 
         this._cleanupExpiredMigrationCache();
     }
@@ -975,6 +1055,16 @@ class KnowledgeBaseManager {
         }
     }
 
+    _resolveTagMemoRequest(options = null) {
+        if (!this.tagMemoEngine) return null;
+        const version = options?.tagMemoVersion ?? options?.tagmemoVersion ?? null;
+        const strictVersion = options?.strictVersion === true;
+        return this.tagMemoEngine.resolveArtifactBundle({
+            version,
+            strictVersion
+        });
+    }
+
     async _searchSpecificIndex(diaryName, vector, k, tagBoost, coreTags = [], coreBoostFactor = 1.33, options = null) {
         const idx = await this._getOrLoadDiaryIndex(diaryName);
 
@@ -993,6 +1083,9 @@ class KnowledgeBaseManager {
         try {
             if (tagBoost > 0 && this.tagMemoEngine) {
                 const preparedBoostResult = options?.preparedBoostResult || options?.boostResult || null;
+                const artifactResolution = preparedBoostResult?.artifactBundle
+                    ? null
+                    : this._resolveTagMemoRequest(options);
                 if (preparedBoostResult?.vector) {
                     // 🌟 请求级 TagBoost 复用：调用方已经对同一 queryVector/tagWeight/coreTags 完成感应，
                     // 搜索层直接使用增强后的向量与 energyField，避免同一轮多占位符/多日记本重复跑 TagMemo。
@@ -1002,8 +1095,18 @@ class KnowledgeBaseManager {
                     tagInfo = preparedBoostResult.info || null;
                     energyField = preparedBoostResult.energyField || null;
                 } else {
-                    // 🌟 TagMemo 逻辑回归：应用 Tag 增强 (强制使用 V6)
-                    const boostResult = this.tagMemoEngine.applyTagBoost(new Float32Array(vector), tagBoost, coreTags, coreBoostFactor);
+                    // 请求级固定资产包：增强与后续重排共享同一代际。
+                    const boostResult = this.tagMemoEngine.applyTagBoost(
+                        new Float32Array(vector),
+                        tagBoost,
+                        coreTags,
+                        coreBoostFactor,
+                        {
+                            artifactBundle: artifactResolution?.bundle,
+                            version: artifactResolution?.requestedVersion,
+                            strictVersion: options?.strictVersion === true
+                        }
+                    );
                     searchVecFloat = boostResult.vector;
                     tagInfo = boostResult.info;
                     energyField = boostResult.energyField || null;
@@ -1034,11 +1137,15 @@ class KnowledgeBaseManager {
         // 🌟 V8: 测地线重排（只重排，不截断）— 在 hydrate 之前执行
         // 使用查询级 energyField，避免全局 lastEnergyField 在 await 间隙被并发搜索覆盖。
         if (options?.geodesicRerank && energyField) {
-            const geoConfig = this.ragParams?.KnowledgeBaseManager?.geodesicRerank || {};
+            const geoConfig = tagInfo?.artifactSig
+                ? (this.tagMemoEngine.getArtifactBundleSnapshot(tagInfo.effectiveVersion)?.potentialFieldConfig || {})
+                : (this.ragParams?.KnowledgeBaseManager?.geodesicRerank || {});
             results = this.tagMemoEngine.geodesicRerank(results, {
                 alpha: options.geoAlpha ?? options.alpha ?? geoConfig.alpha,
                 minGeoSamples: options.minGeoSamples ?? geoConfig.minGeoSamples,
-                energyField
+                energyField,
+                config: geoConfig,
+                version: tagInfo?.effectiveVersion
             });
         }
 
@@ -1155,6 +1262,9 @@ class KnowledgeBaseManager {
 
         if (tagBoost > 0 && this.tagMemoEngine) {
             const preparedBoostResult = options?.preparedBoostResult || options?.boostResult || null;
+            const artifactResolution = preparedBoostResult?.artifactBundle
+                ? null
+                : this._resolveTagMemoRequest(options);
             if (preparedBoostResult?.vector) {
                 searchVecFloat = preparedBoostResult.vector instanceof Float32Array
                     ? preparedBoostResult.vector
@@ -1162,7 +1272,17 @@ class KnowledgeBaseManager {
                 tagInfo = preparedBoostResult.info || null;
                 energyField = preparedBoostResult.energyField || null;
             } else {
-                const boostResult = this.tagMemoEngine.applyTagBoost(new Float32Array(vector), tagBoost, coreTags, coreBoostFactor);
+                const boostResult = this.tagMemoEngine.applyTagBoost(
+                    new Float32Array(vector),
+                    tagBoost,
+                    coreTags,
+                    coreBoostFactor,
+                    {
+                        artifactBundle: artifactResolution?.bundle,
+                        version: artifactResolution?.requestedVersion,
+                        strictVersion: options?.strictVersion === true
+                    }
+                );
                 searchVecFloat = boostResult.vector;
                 tagInfo = boostResult.info;
                 energyField = boostResult.energyField || null;
@@ -1200,11 +1320,15 @@ class KnowledgeBaseManager {
 
         // 测地线必须在物理索引结果合并后执行，确保所有成员共享同一能量场和排序口径。
         if (options?.geodesicRerank && energyField) {
-            const geoConfig = this.ragParams?.KnowledgeBaseManager?.geodesicRerank || {};
+            const geoConfig = tagInfo?.artifactSig
+                ? (this.tagMemoEngine.getArtifactBundleSnapshot(tagInfo.effectiveVersion)?.potentialFieldConfig || {})
+                : (this.ragParams?.KnowledgeBaseManager?.geodesicRerank || {});
             allResults = this.tagMemoEngine.geodesicRerank(allResults, {
                 alpha: options.geoAlpha ?? options.alpha ?? geoConfig.alpha,
                 minGeoSamples: options.minGeoSamples ?? geoConfig.minGeoSamples,
-                energyField
+                energyField,
+                config: geoConfig,
+                version: tagInfo?.effectiveVersion
             });
         }
 
@@ -1275,14 +1399,54 @@ class KnowledgeBaseManager {
     }
 
     /**
-     * 公共接口：应用 TagMemo 增强向量
-     * @param {Float32Array|Array<number>} vector - 原始查询向量
-     * @param {number} tagBoost - 增强因子 (0 到 1)
-     * @returns {{vector: Float32Array, info: object|null}} - 返回增强后的向量和调试信息
+     * 公共接口：应用请求级固定版本的 TagMemo 增强向量。
+     * options.tagMemoVersion 显式指定版本；options.strictVersion=true 时缺失即失败。
      */
-    applyTagBoost(vector, tagBoost, coreTags = [], coreBoostFactor = 1.33) {
-        if (!this.tagMemoEngine) return { vector: vector instanceof Float32Array ? vector : new Float32Array(vector), info: null };
-        return this.tagMemoEngine.applyTagBoost(vector, tagBoost, coreTags, coreBoostFactor);
+    applyTagBoost(vector, tagBoost, coreTags = [], coreBoostFactor = 1.33, options = {}) {
+        if (!this.tagMemoEngine) {
+            if (options.strictVersion === true) {
+                const error = new Error('TagMemoEngine is not available');
+                error.code = 'TAGMEMO_ARTIFACT_UNAVAILABLE';
+                throw error;
+            }
+            return {
+                vector: vector instanceof Float32Array ? vector : new Float32Array(vector),
+                info: null,
+                energyField: null
+            };
+        }
+        const resolution = options.artifactBundle
+            ? null
+            : this.tagMemoEngine.resolveArtifactBundle({
+                version: options.tagMemoVersion ?? options.version ?? null,
+                strictVersion: options.strictVersion === true
+            });
+        return this.tagMemoEngine.applyTagBoost(
+            vector,
+            tagBoost,
+            coreTags,
+            coreBoostFactor,
+            {
+                ...options,
+                artifactBundle: options.artifactBundle || resolution?.bundle,
+                version: resolution?.requestedVersion || options.tagMemoVersion || options.version
+            }
+        );
+    }
+
+    getTagMemoArtifactSnapshot(version = null, options = {}) {
+        if (!this.tagMemoEngine) return null;
+        const resolution = this.tagMemoEngine.resolveArtifactBundle({
+            version,
+            strictVersion: options.strictVersion === true
+        });
+        return {
+            bundle: resolution.bundle,
+            requestedVersion: resolution.requestedVersion,
+            effectiveVersion: resolution.effectiveVersion,
+            fallbackUsed: resolution.fallbackUsed,
+            fallbackReason: resolution.fallbackReason
+        };
     }
 
     /**
@@ -1310,11 +1474,18 @@ class KnowledgeBaseManager {
      */
     geodesicRerank(candidates, options = {}) {
         if (!this.tagMemoEngine) return candidates;
-        const geoConfig = this.ragParams?.KnowledgeBaseManager?.geodesicRerank || {};
+        const bundle = options.artifactBundle
+            || this.tagMemoEngine.getArtifactBundleSnapshot(options.tagMemoVersion || options.version || null);
+        const geoConfig = options.config
+            || bundle?.potentialFieldConfig
+            || this.ragParams?.KnowledgeBaseManager?.geodesicRerank
+            || {};
         return this.tagMemoEngine.geodesicRerank(candidates, {
             alpha: options.alpha ?? options.geoAlpha ?? geoConfig.alpha,
             minGeoSamples: options.minGeoSamples ?? geoConfig.minGeoSamples,
-            energyField: options.energyField
+            energyField: options.energyField,
+            config: geoConfig,
+            version: bundle?.version
         });
     }
 
@@ -2103,13 +2274,19 @@ class KnowledgeBaseManager {
 
                 const insertTag = this.db.prepare('INSERT INTO tags (name, vector) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET vector = excluded.vector');
                 const getTagId = this.db.prepare('SELECT id FROM tags WHERE name = ?');
-                // 🌟 V8.2: 向量更新失效钩子 — tag 向量被(重)写入时，删除涉及该 tag 的 sim 行，
-                // 由 Rust 增量补回，防止陈旧缓存污染。
+                // 🌟 V8.2/V9: 向量更新失效钩子 — 正值、负缓存和处理状态必须一起失效，
+                // 由 Rust 增量补回，防止陈旧 artifact 或 below_threshold 状态掩盖重算。
                 const invalidatePairSim = this.db.prepare(
                     'DELETE FROM tag_pair_similarity WHERE tag_a = ? OR tag_b = ?'
                 );
+                const invalidatePairSimStatus = this.db.prepare(
+                    'DELETE FROM tag_pair_similarity_status WHERE tag_a = ? OR tag_b = ?'
+                );
                 const invalidateIntrinsicResidual = this.db.prepare(
                     'DELETE FROM tag_intrinsic_residuals WHERE tag_id = ?'
+                );
+                const invalidateIntrinsicResidualStatus = this.db.prepare(
+                    'DELETE FROM tag_intrinsic_residual_status WHERE tag_id = ?'
                 );
 
                 newTags.forEach((t, i) => {
@@ -2121,9 +2298,11 @@ class KnowledgeBaseManager {
                     tagCache.set(t, { id, vector: vecBuf });
                     tagUpdates.push({ id, vec: vecFloat });
                     newTagIds.push(id);
-                    // 失效旧的 pairwise similarity / intrinsic residual 记录
+                    // 失效旧的 pairwise similarity / intrinsic residual 记录及其状态缓存
                     invalidatePairSim.run(id, id);
+                    invalidatePairSimStatus.run(id, id);
                     invalidateIntrinsicResidual.run(id);
+                    invalidateIntrinsicResidualStatus.run(id);
                 });
 
                 const insertFile = this.db.prepare('INSERT INTO files (path, diary_name, checksum, mtime, size, updated_at) VALUES (?, ?, ?, ?, ?, ?)');
