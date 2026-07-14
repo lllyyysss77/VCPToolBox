@@ -317,6 +317,9 @@ class TagMemoEngine {
         const kernel = new Map();
         const wormholeEdges = new Set();
         const outboundMass = Math.max(0.01, Math.min(1, Number(v9Config.outboundMass ?? 0.95)));
+        // V9.0.1 Association Probe：只在既有虫洞存在时，从总出流预算内部
+        // 重分配最多 0.05 给虫洞条件分布；不增加总能量，也不改变虫洞判据。
+        const associationReserveMass = Math.min(0.05, outboundMass);
         const evidenceCompression = Math.max(0.01, Number(v9Config.evidenceCompression ?? 1));
         const wormholeGain = Math.max(1, Number(v9Config.wormholeGain ?? 1.35));
         const tensionThreshold = Math.max(0, Number(v9Config.tensionThreshold ?? 1));
@@ -325,6 +328,7 @@ class TagMemoEngine {
             if (!(edges instanceof Map) || edges.size === 0) continue;
             const rawEdges = [];
             let rawSum = 0;
+            let wormholeRawSum = 0;
 
             for (const [targetId, compatWeight] of edges.entries()) {
                 const evidence = Math.log1p(Math.max(0, Number(compatWeight) || 0) * evidenceCompression);
@@ -334,12 +338,19 @@ class TagMemoEngine {
                 if (!Number.isFinite(rawConductance) || rawConductance <= 0) continue;
                 rawEdges.push([targetId, rawConductance, isWormhole]);
                 rawSum += rawConductance;
+                if (isWormhole) wormholeRawSum += rawConductance;
             }
 
             if (rawSum <= 0) continue;
             const normalizedEdges = new Map();
+            const reserveMass = wormholeRawSum > 0 ? associationReserveMass : 0;
+            const mainMass = outboundMass - reserveMass;
             for (const [targetId, rawConductance, isWormhole] of rawEdges) {
-                const conductance = outboundMass * rawConductance / rawSum;
+                const mainConductance = mainMass * rawConductance / rawSum;
+                const associationConductance = isWormhole && wormholeRawSum > 0
+                    ? reserveMass * rawConductance / wormholeRawSum
+                    : 0;
+                const conductance = mainConductance + associationConductance;
                 normalizedEdges.set(targetId, conductance);
                 if (isWormhole) wormholeEdges.add(`${sourceId}:${targetId}`);
             }
